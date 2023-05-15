@@ -39,7 +39,7 @@ use libp2p_swarm::{
 use smallvec::SmallVec;
 use std::{
     collections::VecDeque,
-    fmt, io,
+    fmt,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -71,8 +71,6 @@ where
     substream_timeout: Duration,
     /// The current connection keep-alive.
     keep_alive: KeepAlive,
-    /// A pending fatal error that results in the connection being closed.
-    pending_error: Option<ConnectionHandlerUpgrErr<io::Error>>,
     /// Queue of events to emit in `poll()`.
     pending_events: VecDeque<Event<TCodec>>,
     /// Outbound upgrades waiting to be emitted as an `OutboundSubstreamRequest`.
@@ -113,7 +111,6 @@ where
             outbound: VecDeque::new(),
             inbound: FuturesUnordered::new(),
             pending_events: VecDeque::new(),
-            pending_error: None,
             inbound_request_id,
         }
     }
@@ -156,40 +153,22 @@ where
                 // the remote peer does not support the requested protocol(s).
                 self.pending_events
                     .push_back(Event::OutboundUnsupportedProtocols(info));
+                log::debug!("outbound stream {info} failed: Failed negotiation");
             }
-            _ => {
-                // Anything else is considered a fatal error or misbehaviour of
-                // the remote peer and results in closing the connection.
-                self.pending_error = Some(error);
+            ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Apply(e)) => {
+                log::debug!("outbound stream {info} failed: {e}");
             }
+            _ => {}
         }
     }
     fn on_listen_upgrade_error(
         &mut self,
-        ListenUpgradeError { info, error }: ListenUpgradeError<
+        ListenUpgradeError { error, info }: ListenUpgradeError<
             <Self as ConnectionHandler>::InboundOpenInfo,
             <Self as ConnectionHandler>::InboundProtocol,
         >,
     ) {
-        match error {
-            ConnectionHandlerUpgrErr::Timeout => {
-                self.pending_events.push_back(Event::InboundTimeout(info))
-            }
-            ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Select(NegotiationError::Failed)) => {
-                // The local peer merely doesn't support the protocol(s) requested.
-                // This is no reason to close the connection, which may
-                // successfully communicate with other protocols already.
-                // An event is reported to permit user code to react to the fact that
-                // the local peer does not support the requested protocol(s).
-                self.pending_events
-                    .push_back(Event::InboundUnsupportedProtocols(info));
-            }
-            _ => {
-                // Anything else is considered a fatal error or misbehaviour of
-                // the remote peer and results in closing the connection.
-                self.pending_error = Some(error);
-            }
-        }
+        log::debug!("inbound stream {info} failed: {error}");
     }
 }
 
@@ -284,7 +263,7 @@ where
 {
     type InEvent = RequestProtocol<TCodec>;
     type OutEvent = Event<TCodec>;
-    type Error = ConnectionHandlerUpgrErr<io::Error>;
+    type Error = void::Void;
     type InboundProtocol = ResponseProtocol<TCodec>;
     type OutboundProtocol = RequestProtocol<TCodec>;
     type OutboundOpenInfo = RequestId;
@@ -338,12 +317,6 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<ConnectionHandlerEvent<RequestProtocol<TCodec>, RequestId, Self::OutEvent, Self::Error>>
     {
-        // Check for a pending (fatal) error.
-        if let Some(err) = self.pending_error.take() {
-            // The handler will not be polled again by the `Swarm`.
-            return Poll::Ready(ConnectionHandlerEvent::Close(err));
-        }
-
         // Drain pending events.
         if let Some(event) = self.pending_events.pop_front() {
             return Poll::Ready(ConnectionHandlerEvent::Custom(event));
